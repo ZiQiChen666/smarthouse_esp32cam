@@ -18,6 +18,7 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include "esp_http_server.h"
 
 // =====================  USER CONFIG  =====================
@@ -939,6 +940,254 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
 }
 
+// =========================================================
+//  PHONE APP LINK  -  UDP discovery + TCP client
+// =========================================================
+// The ESP32-CAM is the TCP *client*.  It cannot know the phone app's IP
+// up-front (it is dynamic / not provided), so it finds the app on the LAN
+// by itself, connects, and reports its own web URL (http://<esp-ip>/) so
+// the app can open the live stream.
+//
+// Discovery : ESP32 broadcasts a UDP probe; the app answers with its TCP
+//             port.  If the app never answers UDP, ESP32 can fall back to
+//             scanning its own /24 subnet for the TCP server.
+// Transport : line based JSON, '\n' terminated.
+//
+//   ESP32 -> APP   UDP broadcast :4210
+//       SMARTHOUSE_DISCOVER:ESP32CAM\n
+//   APP   -> ESP32 UDP unicast (same port)
+//       SMARTHOUSE_SERVER:4211\n
+//   ESP32 -> APP   TCP :4211
+//       {"type":"register","name":"ESP32-CAM","ip":"...","port":80,
+//        "url":"http://.../","rssi":-52}\n
+//       {"type":"heartbeat",...}\n          every APP_HEARTBEAT_MS
+// ---------------------------------------------------------
+#define APP_DISCOVERY_PORT   4210    // UDP discovery port (both sides)
+#define APP_TCP_PORT         4211    // default TCP port of the phone app
+#define APP_DISCOVERY_MS     3000    // send a probe every 3 s
+#define APP_HEARTBEAT_MS     10000   // keep-alive every 10 s
+#define APP_CONNECT_TIMEOUT  1500    // ms
+#define APP_RETRY_MS         3000    // reconnect attempt spacing
+#define APP_RETRY_LIMIT      3       // failed connects before re-discover
+#define APP_SCAN_FALLBACK    1       // 1 = scan /24 if UDP gets no answer
+#define APP_SCAN_START_MS    15000   // start scanning after this long
+#define APP_SCAN_HOST_MS     120     // one host probed per interval
+#define APP_SCAN_TIMEOUT     200     // ms per host during a scan
+
+static WiFiUDP    appUdp;
+static WiFiClient appTcp;
+
+static bool       appUdpStarted   = false;
+static bool       appServerKnown  = false;
+static IPAddress  appServerIP;
+static uint16_t   appServerPort   = APP_TCP_PORT;
+static uint32_t   appLastProbe    = 0;
+static uint32_t   appLastConnect  = 0;
+static uint32_t   appLastBeat     = 0;
+static uint32_t   appDiscoverRef  = 0;   // when discovery started (scan guard)
+static uint32_t   appLastScan     = 0;
+static int        appScanHost     = 1;
+static int        appConnFails    = 0;
+
+// Subnet-directed broadcast address, e.g. 192.168.1.255
+static IPAddress appBroadcastIP() {
+  IPAddress ip   = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  return IPAddress((uint8_t)(ip[0] | ~mask[0]),
+                   (uint8_t)(ip[1] | ~mask[1]),
+                   (uint8_t)(ip[2] | ~mask[2]),
+                   (uint8_t)(ip[3] | ~mask[3]));
+}
+
+static String appUrl() {
+  return String("http://") + WiFi.localIP().toString() + "/";
+}
+
+// ---- UDP discovery -------------------------------------------------
+static void appSendProbe() {
+  const uint8_t *p   = (const uint8_t *)"SMARTHOUSE_DISCOVER:ESP32CAM\n";
+  size_t         len = strlen((const char *)p);
+
+  IPAddress bcast = appBroadcastIP();
+  appUdp.beginPacket(bcast, APP_DISCOVERY_PORT);
+  appUdp.write(p, len);
+  appUdp.endPacket();
+
+  // Global broadcast as well: survives unusual subnet masks.
+  appUdp.beginPacket(IPAddress(255, 255, 255, 255), APP_DISCOVERY_PORT);
+  appUdp.write(p, len);
+  appUdp.endPacket();
+
+  Serial.printf("[APP] probe -> %s:%u\n", bcast.toString().c_str(),
+                APP_DISCOVERY_PORT);
+}
+
+static void appPollReply() {
+  int sz = appUdp.parsePacket();
+  if (sz <= 0) return;
+
+  IPAddress from = appUdp.remoteIP();
+  char buf[96];
+  int  n = appUdp.read(buf, sizeof(buf) - 1);
+  if (n <= 0) return;
+  buf[n] = '\0';
+
+  if (strncmp(buf, "SMARTHOUSE_SERVER", 17) != 0) return;
+
+  uint16_t port = APP_TCP_PORT;
+  char *colon = strrchr(buf, ':');
+  if (colon != NULL && atoi(colon + 1) > 0) port = (uint16_t)atoi(colon + 1);
+
+  if (!appServerKnown || appServerIP != from || appServerPort != port) {
+    Serial.printf("[APP] server found at %s:%u\n", from.toString().c_str(),
+                  port);
+  }
+  appServerIP    = from;
+  appServerPort  = port;
+  appServerKnown = true;
+  appConnFails   = 0;
+}
+
+// ---- TCP client ----------------------------------------------------
+static void appSendRegister() {
+  char msg[192];
+  snprintf(msg, sizeof(msg),
+           "{\"type\":\"register\",\"name\":\"ESP32-CAM\","
+           "\"ip\":\"%s\",\"port\":80,\"url\":\"%s\",\"rssi\":%d}\n",
+           WiFi.localIP().toString().c_str(), appUrl().c_str(),
+           (int)WiFi.RSSI());
+  appTcp.print(msg);
+  Serial.printf("[APP] >> %s", msg);
+}
+
+static size_t appSendHeartbeat() {
+  char msg[192];
+  snprintf(msg, sizeof(msg),
+           "{\"type\":\"heartbeat\",\"ip\":\"%s\",\"port\":80,"
+           "\"url\":\"%s\",\"rssi\":%d}\n",
+           WiFi.localIP().toString().c_str(), appUrl().c_str(),
+           (int)WiFi.RSSI());
+  return appTcp.print(msg);
+}
+
+static bool appConnect() {
+  if (!appServerKnown) return false;
+
+  appTcp.stop();
+  Serial.printf("[APP] TCP connect %s:%u ...\n",
+                appServerIP.toString().c_str(), appServerPort);
+  if (!appTcp.connect(appServerIP, appServerPort, APP_CONNECT_TIMEOUT)) {
+    Serial.println("[APP] connect failed");
+    return false;
+  }
+  Serial.println("[APP] connected");
+  appTcp.setTimeout(200);   // keep readStringUntil() from blocking long
+  appSendRegister();
+  appLastBeat = millis();
+  return true;
+}
+
+static void appReadFromServer() {
+  while (appTcp.available()) {
+    String line = appTcp.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    Serial.printf("[APP] << %s\n", line.c_str());
+    // Example command handling:
+    // if (line == "ping") appTcp.print("{\"type\":\"pong\"}\n");
+  }
+}
+
+// Fallback: probe one host of the local /24 for the app's TCP port.
+static void appScanStep() {
+  IPAddress local = WiFi.localIP();
+  if (appScanHost > 254) appScanHost = 1;
+  uint8_t host = (uint8_t)appScanHost++;
+
+  IPAddress target(local[0], local[1], local[2], host);
+  if ((uint32_t)target == (uint32_t)local) return;
+
+  WiFiClient probe;
+  if (probe.connect(target, APP_TCP_PORT, APP_SCAN_TIMEOUT)) {
+    Serial.printf("[APP] TCP server found by scan at %s:%u\n",
+                  target.toString().c_str(), APP_TCP_PORT);
+    appServerIP    = target;
+    appServerPort  = APP_TCP_PORT;
+    appServerKnown = true;
+    appConnFails   = 0;
+  }
+  probe.stop();
+}
+
+static void appClientBegin() {
+  if (appUdpStarted) return;
+  appUdpStarted = (appUdp.begin(APP_DISCOVERY_PORT) == 1);
+  Serial.printf("[APP] UDP discovery %s (port %u)\n",
+                appUdpStarted ? "ready" : "FAILED", APP_DISCOVERY_PORT);
+}
+
+// Call this from loop() - fully non blocking.
+static void appClientLoop() {
+  uint32_t now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (appTcp.connected()) appTcp.stop();
+    appServerKnown  = false;
+    appDiscoverRef  = now;
+    appScanHost     = 1;
+    return;
+  }
+
+  appClientBegin();
+  appPollReply();   // drain discovery replies at all times
+
+  // -------- connected: heartbeat + read --------
+  if (appTcp.connected()) {
+    appReadFromServer();
+    if (now - appLastBeat >= APP_HEARTBEAT_MS) {
+      appLastBeat = now;
+      if (appSendHeartbeat() == 0) {   // write failed -> link is gone
+        Serial.println("[APP] heartbeat failed - disconnected");
+        appTcp.stop();
+        return;
+      }
+    }
+    return;
+  }
+
+  // -------- known server: (re)connect --------
+  if (appServerKnown) {
+    if (now - appLastConnect >= APP_RETRY_MS) {
+      appLastConnect = now;
+      if (appConnect()) {
+        appConnFails = 0;
+      } else if (++appConnFails >= APP_RETRY_LIMIT) {
+        Serial.println("[APP] too many failures - re-discovering");
+        appServerKnown = false;
+        appConnFails   = 0;
+        appDiscoverRef = now;
+        appScanHost    = 1;
+      }
+    }
+    return;
+  }
+
+  // -------- unknown server: discover --------
+  if (now - appLastProbe >= APP_DISCOVERY_MS) {
+    appLastProbe = now;
+    appSendProbe();
+  }
+
+#if APP_SCAN_FALLBACK
+  if (now - appDiscoverRef >= APP_SCAN_START_MS &&
+      now - appLastScan >= APP_SCAN_HOST_MS) {
+    appLastScan = now;
+    appScanStep();
+  }
+#endif
+}
+// =========================================================
+
 // ---------------------------------------------------------
 //  Start the HTTP servers
 // ---------------------------------------------------------
@@ -1016,13 +1265,21 @@ void setup() {
     while (true) delay(1000);
   }
 
-  if (connectWiFi()) {
-    startCameraServer();
+  bool wifiOK = connectWiFi();
+
+  // Start the web server and the phone-app link regardless of the initial
+  // WiFi result.  appClientLoop() keeps retrying, and the web UI becomes
+  // reachable as soon as the network is up.
+  startCameraServer();
+  appClientBegin();
+
+  if (wifiOK) {
     Serial.println("-------------------------------------------");
     Serial.printf("Web UI       :    http://%s/\n", WiFi.localIP().toString().c_str());
     Serial.printf("Live stream  :    http://%s/stream\n", WiFi.localIP().toString().c_str());
     Serial.printf("Snapshot     :    http://%s/capture\n", WiFi.localIP().toString().c_str());
     Serial.printf("Status       :    http://%s/status\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Phone app    :    discovering UDP :%u ...\n", APP_DISCOVERY_PORT);
     Serial.println("-------------------------------------------");
   } else {
     Serial.println("[WARN] no WiFi - camera running but not accessible");
@@ -1038,5 +1295,7 @@ void loop() {
       WiFi.reconnect();
     }
   }
+
+  appClientLoop();   // UDP discovery + TCP client (non blocking)
   delay(10);
 }
